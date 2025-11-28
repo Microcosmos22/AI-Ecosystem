@@ -1,10 +1,60 @@
 import pygame, random, math, numpy as np
 pygame.init()
+PRED_SIGHT_RADIUS = 200  # pixels
 
 screen = pygame.display.set_mode((0,0), pygame.FULLSCREEN)
 W, H = screen.get_size()
 clock = pygame.time.Clock()
-font = pygame.font.SysFont(None, 28)
+
+def push_from_border(agent, margin=50, force=9.0):
+    dx = 0.0
+    dy = 0.0
+
+    print(f"{agent.x < margin}, {agent.x > agent.W - margin}, {agent.y < margin}, {agent.y > agent.H}")
+    print(dx, dy)
+    if agent.x < margin:
+        dx += force
+    if agent.x > agent.W - margin:
+        dx -= force
+    if agent.y < margin:
+        dy += force
+    if agent.y > agent.H - margin:
+        dy -= force
+    return float(dx), float(dy)  # <-- return plain floats
+
+
+def nearest_screen_edge(agent):
+    """
+    Returns the (x, y) coordinate of the nearest screen edge to the agent.
+    """
+    distances = {
+        'left': agent.x,
+        'right': agent.W - agent.x,
+        'top': agent.y,
+        'bottom': agent.H - agent.y
+    }
+    # find the nearest edge
+    nearest_edge = min(distances, key=distances.get)
+
+    if nearest_edge == 'left':
+        return 0, agent.y
+    elif nearest_edge == 'right':
+        return agent.W, agent.y
+    elif nearest_edge == 'top':
+        return agent.x, 0
+    else:  # bottom
+        return agent.x, agent.H
+
+
+def neighbour_offset(agent, group, k=3):
+    others = [a for a in group if a is not agent]
+    if not others:
+        return 0.0, 0.0
+    # sort by distance
+    nearest = sorted(others, key=lambda o:(o.x-agent.x)**2+(o.y-agent.y)**2)[:k]
+    dx = sum(o.x - agent.x for o in nearest) / max(1,len(nearest))
+    dy = sum(o.y - agent.y for o in nearest) / max(1,len(nearest))
+    return dx, dy
 
 def normalize(v):
     d = math.hypot(v[0], v[1]) + 1e-6
@@ -15,138 +65,285 @@ def mlp_fwd(x, w1, b1, w2, b2):
     o = np.tanh(h @ w2 + b2)
     return h, o
 
+
+
 def mlp_back(x, h, o, target, w1, b1, w2, b2, lr):
-    # simple MSE backprop for tiny net
     go = (o - target) * (1 - o**2)
     gw2 = np.outer(h, go)
     gb2 = go
-    gh = (go @ w2.T) * (1 - h**2)
+    gh  = (go @ w2.T) * (1 - h**2)
     gw1 = np.outer(x, gh)
     gb1 = gh
-    w1 -= lr * gw1; b1 -= lr * gb1
-    w2 -= lr * gw2; b2 -= lr * gb2
-    return w1, b1, w2, b2
+    w1 -= lr*gw1; b1 -= lr*gb1
+    w2 -= lr*gw2; b2 -= lr*gb2
+    return w1,b1,w2,b2
 
 class Agent:
     def __init__(self, color, kind, W, H):
         self.kind = kind
         self.color = color
-        self.W = W; self.H = H
+        self.W = W
+        self.H = H
         self.respawn()
-        # START WITH ZERO WEIGHTS (no prior policy)
-        self.w1 = np.zeros((2, 6))
+
+        # determine input size
+        if kind == "prey":
+            in_size = 4   # dx, dy + neighbour dx, dy
+        else:
+            in_size = 4   # dx, dy + size, speed_factor
+
+        # initialize weights correctly
+        self.w1 = np.zeros((in_size, 6))
         self.b1 = np.zeros(6)
         self.w2 = np.zeros((6, 2))
         self.b2 = np.zeros(2)
-        self.lr = 0.02 if kind == "pred" else 0.015
-        self.explore = 1.2  # exploration noise amplitude (decays)
+        self.lr = 0.02
         self.score = 0
+        self.explore = 1.0
+
 
     def respawn(self):
-        self.x = random.random() * self.W
-        self.y = random.random() * self.H
+        self.x = random.random()*self.W
+        self.y = random.random()*self.H
         self.vx = self.vy = 0
+        self.size = 8
+        self.speed_factor = 1.0
 
-    def forward_and_move(self, tx, ty):
-        dx = (tx - self.x) / self.W
-        dy = (ty - self.y) / self.H
-        inp = np.array([dx, dy])
+    def forward_and_move(self, target, neigh_offset=None):
+        # compute NN input
+        dx = (target[0] - self.x) / self.W
+        dy = (target[1] - self.y) / self.H
+
+        if self.kind == "prey" and neigh_offset is not None:
+            ndx = neigh_offset[0] / self.W
+            ndy = neigh_offset[1] / self.H
+            inp = np.array([dx, dy, ndx, ndy])
+        elif self.kind == "prey":
+            inp = np.array([dx, dy, 0.0, 0.0])
+        else:
+            inp = np.array([dx, dy, self.size/40, self.speed_factor])
+
         h, out = mlp_fwd(inp, self.w1, self.b1, self.w2, self.b2)
 
-        # exploration: essential because zero weights => zero output
-        noise = np.random.randn(2) * self.explore
-        out_noisy = out + noise
+        # compute velocity safely
+        speed = 6 * (self.speed_factor if self.kind=="pred" else 1.0)
+        self.vx = float(out[0] * speed)
+        self.vy = float(out[1] * speed)
 
-        # small decay of exploration over time
-        self.explore *= 0.9998
+        # add border push (prey only, but can do for predators too)
+        bx, by = push_from_border(self)
+        self.vx += bx
+        self.vy += by
 
-        self.vx, self.vy = out_noisy * 6
+        # update position
         self.x += self.vx
         self.y += self.vy
-
-        # keep inside screen box
         self.x = max(0, min(self.W, self.x))
         self.y = max(0, min(self.H, self.y))
 
         return inp, h, out
 
+
     def learn(self, inp, h, out, target):
-        self.w1, self.b1, self.w2, self.b2 = mlp_back(
-            inp, h, out, target, self.w1, self.b1, self.w2, self.b2, self.lr
+        self.w1,self.b1,self.w2,self.b2 = mlp_back(
+            inp,h,out,target,self.w1,self.b1,self.w2,self.b2,self.lr
         )
 
-    def draw(self, surf):
-        pygame.draw.circle(surf, self.color, (int(self.x), int(self.y)), 8)
+    def draw(self):
+        pygame.draw.circle(screen, self.color,
+                           (int(self.x), int(self.y)), int(self.size))
 
-# create agents
-prey = [Agent((80,180,255), "prey", W, H) for _ in range(20)]
-pred = [Agent((230,90,80), "pred", W, H) for _ in range(7)]
+prey = [Agent((80,180,255),"prey",W,H) for _ in range(20)]
+pred = [Agent((255,90,80),"pred",W,H) for _ in range(6)]
 
-running = True
+running=True
 while running:
     for e in pygame.event.get():
-        if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
-            running = False
+        if e.type==pygame.QUIT or (e.type==pygame.KEYDOWN and e.key==pygame.K_ESCAPE):
+            running=False
 
-    mx, my = pygame.mouse.get_pos()
+    mx,my = pygame.mouse.get_pos()
     screen.fill((12,12,20))
 
-    # predators act: try to move toward nearest prey; rewarded for eating
-    for p in pred:
-        if not prey: break
-        nearest = min(prey, key=lambda f: (f.x - p.x)**2 + (f.y - p.y)**2)
-        inp, h, out = p.forward_and_move(nearest.x, nearest.y)
-        dist = math.hypot(p.x - nearest.x, p.y - nearest.y)
-        eaten = dist < 18
-        if eaten:
-            p.score += 1                 # predator gains point
-            # strong positive target: point toward prey direction
-            targ = normalize((nearest.x - p.x, nearest.y - p.y)) * 3.0
-            nearest.respawn()
-        else:
-            # weaker target: encourage moving toward prey
-            targ = normalize((nearest.x - p.x, nearest.y - p.y)) * 0.6
-        p.learn(inp, h, out, targ)
-        p.draw(screen)
+    # predators
+    import pygame, random, math, numpy as np
+    pygame.init()
+    PRED_SIGHT_RADIUS = 200  # pixels
 
-    # prey act: learn to flee from nearest predator and from mouse (mouse eats prey)
-    for f in prey:
-        nearest_pred = min(pred, key=lambda q: (q.x - f.x)**2 + (q.y - f.y)**2)
-        # combine influences: primary is predator, secondary is mouse position
-        # use predator as target to flee from
-        inp, h, out = f.forward_and_move(nearest_pred.x, nearest_pred.y)
-        dist_pred = math.hypot(f.x - nearest_pred.x, f.y - nearest_pred.y)
-        eaten_by_pred = dist_pred < 18
-        # mouse eat check
-        eaten_by_mouse = math.hypot(f.x - mx, f.y - my) < 25
+    screen = pygame.display.set_mode((0,0), pygame.FULLSCREEN)
+    W, H = screen.get_size()
+    clock = pygame.time.Clock()
 
-        if eaten_by_pred:
-            f.score -= 1                # prey loses point when eaten by predator
-            targ = -normalize((nearest_pred.x - f.x, nearest_pred.y - f.y)) * 3.0
-            f.respawn()
-        else:
-            # encourage fleeing (away from predator)
-            targ = -normalize((nearest_pred.x - f.x, nearest_pred.y - f.y)) * 0.8
+    def neighbour_offset(agent, group, k=3):
+        others = [a for a in group if a is not agent]
+        if not others:
+            return 0.0, 0.0
+        # sort by distance
+        nearest = sorted(others, key=lambda o:(o.x-agent.x)**2+(o.y-agent.y)**2)[:k]
+        dx = sum(o.x - agent.x for o in nearest) / max(1,len(nearest))
+        dy = sum(o.y - agent.y for o in nearest) / max(1,len(nearest))
+        return dx, dy
 
-        if eaten_by_mouse:
-            f.score -= 1                # prey loses point when eaten by mouse
-            # strong flee target from mouse and respawn
-            targ_mouse = -normalize((mx - f.x, my - f.y)) * 3.0
-            f.respawn()
-            # learn from mouse-eaten event too
-            f.learn(inp, h, out, targ_mouse)
-        else:
+    def normalize(v):
+        d = math.hypot(v[0], v[1]) + 1e-6
+        return np.array([v[0]/d, v[1]/d])
+
+    def mlp_fwd(x, w1, b1, w2, b2):
+        h = np.tanh(x @ w1 + b1)
+        o = np.tanh(h @ w2 + b2)
+        return h, o
+
+    def mlp_back(x, h, o, target, w1, b1, w2, b2, lr):
+        go = (o - target) * (1 - o**2)
+        gw2 = np.outer(h, go)
+        gb2 = go
+        gh  = (go @ w2.T) * (1 - h**2)
+        gw1 = np.outer(x, gh)
+        gb1 = gh
+        w1 -= lr*gw1; b1 -= lr*gb1
+        w2 -= lr*gw2; b2 -= lr*gb2
+        return w1,b1,w2,b2
+
+
+    prey = [Agent((80,180,255),"prey",W,H) for _ in range(20)]
+    pred = [Agent((255,90,80),"pred",W,H) for _ in range(6)]
+
+    running=True
+    while running:
+        for e in pygame.event.get():
+            if e.type==pygame.QUIT or (e.type==pygame.KEYDOWN and e.key==pygame.K_ESCAPE):
+                running=False
+
+        screen.fill((12,12,20))
+
+
+        # predators
+        for p in pred:
+            p.vy, p.vx = 0, 0
+            prev_x, prev_y = p.x, p.y
+            distance_moved = math.hypot(p.x - prev_x, p.y - prev_y)
+
+            targ = 0
+            border_push = push_from_border(p)   # or p for predator
+
+            p.vx += border_push[0]
+            p.vy += border_push[1]
+
+            # get prey within sight radius
+            visible_prey = [f for f in prey if math.hypot(f.x - p.x, f.y - p.y) <= PRED_SIGHT_RADIUS]
+
+            visible_prey = [f for f in prey if math.hypot(f.x - p.x, f.y - p.y) <= PRED_SIGHT_RADIUS]
+            if visible_prey:
+                nearest = min(visible_prey, key=lambda f: (f.x - p.x)**2 + (f.y - p.y)**2)
+                tpos = (nearest.x, nearest.y)
+                inp, h, out = p.forward_and_move(tpos)
+
+                d = math.hypot(p.x - nearest.x, p.y - nearest.y)
+                eaten = d < p.size + 5
+
+                if eaten:
+                    p.score += 1
+                    p.size += 1.4
+                    p.speed_factor *= 0.92
+                    nearest.respawn()
+                    targ = normalize((nearest.x - p.x, nearest.y - p.y)) * 3
+                else:
+                    targ = normalize((nearest.x - p.x, nearest.y - p.y)) * 0.6
+
+                # apply border penalty
+
+                p.learn(inp, h, out, targ)
+
+                # natural shrinking
+                p.size = max(6, p.size - 0.003)
+                p.speed_factor = max(0.4, p.speed_factor + 0.0003)
+
+                p.draw()
+            else:
+                # encourage predator to roam
+                                # before updating position
+                prev_pos = np.array([p.x, p.y])
+                inp, h, out = p.forward_and_move((p.x, p.y))  # current NN output
+                movement = np.array([p.vx, p.vy])              # actual movement including border push
+                targ = normalize(movement) * 0.5               # scale reward for roaming
+                p.learn(inp, h, out, targ)
+
+                p.draw()
+
+
+        # prey
+        for f in prey:
+            target = 0
+
+            f.vy, f.vx = 0, 0
+
+            border_push = push_from_border(f)   # or p for predator
+            #targ += border_push
+            f.vx += border_push[0]
+            f.vy += border_push[1]
+
+
+            nearest_pred = min(pred, key=lambda q:(q.x-f.x)**2+(q.y-f.y)**2)
+
+            ndx, ndy = neighbour_offset(f, prey)
+            inp, h, out = f.forward_and_move((nearest_pred.x, nearest_pred.y), (ndx, ndy))
+
+            dist = math.hypot(f.x - nearest_pred.x, f.y - nearest_pred.y)
+            eaten_pred = dist < nearest_pred.size + 5
+            eaten_mouse = math.hypot(f.x - mx, f.y - my) < 18
+
+            if eaten_pred:
+                f.score -= 1
+                targ = -normalize((nearest_pred.x - f.x, nearest_pred.y - f.y)) * 3
+                f.respawn()
+            else:
+                targ = -normalize((nearest_pred.x - f.x, nearest_pred.y - f.y)) * 0.8
+
+            # mouse penalty
+            if eaten_mouse:
+                f.score -= 1
+                targ_mouse = -normalize((mx - f.x, my - f.y)) * 3
+                f.respawn()
+                f.learn(inp, h, out, targ_mouse)  # separate learn for mouse event
+
             f.learn(inp, h, out, targ)
+            f.draw()
 
-        f.draw(screen)
+        pygame.display.flip()
+        clock.tick(60)
 
-    # Draw simple HUD: total scores
-    total_pred_score = sum(p.score for p in pred)
-    total_prey_score = sum(f.score for f in prey)
-    hud1 = font.render(f"Predators score: {total_pred_score}", True, (255,200,200))
-    hud2 = font.render(f"Prey score: {total_prey_score}", True, (200,230,255))
-    screen.blit(hud1, (12, 12))
-    screen.blit(hud2, (12, 40))
+    pygame.quit()
+
+
+    # prey
+    for f in prey:
+        nearest_pred = min(pred, key=lambda q:(q.x-f.x)**2+(q.y-f.y)**2)
+        ndx, ndy = neighbour_offset(f, prey)   # new line
+
+        inp,h,out = f.forward_and_move(
+            (nearest_pred.x, nearest_pred.y),
+            (ndx, ndy)
+        )
+
+        dist = math.hypot(f.x-nearest_pred.x, f.y-nearest_pred.y)
+        eaten_pred = dist < nearest_pred.size + 5
+        eaten_mouse = math.hypot(f.x-mx,f.y-my)<18
+
+        if eaten_pred:
+            f.score -= 1
+            targ = -normalize((nearest_pred.x-f.x, nearest_pred.y-f.y))*3
+            f.respawn()
+        else:
+            targ = -normalize((nearest_pred.x-f.x, nearest_pred.y-f.y))*0.8
+
+        if eaten_mouse:
+            f.score -= 1
+            targ_mouse = -normalize((mx-f.x, my-f.y))*3
+            f.respawn()
+            f.learn(inp,h,out,targ_mouse)
+
+        f.learn(inp,h,out,targ)
+        f.draw()
 
     pygame.display.flip()
     clock.tick(60)
