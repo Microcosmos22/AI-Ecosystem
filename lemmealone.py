@@ -6,6 +6,23 @@ screen = pygame.display.set_mode((0,0), pygame.FULLSCREEN)
 W, H = screen.get_size()
 clock = pygame.time.Clock()
 
+def neighbour_vectors(agent, group, k=3, none = True):
+    others = [a for a in group if a is not agent]
+    nearest = sorted(others, key=lambda o: (o.x-agent.x)**2 + (o.y-agent.y)**2)[:k]
+
+    vectors = []
+    for n in nearest:
+        vectors.extend([(n.x - agent.x) / agent.W, (n.y - agent.y) / agent.H])
+
+    # Pad with zeros if fewer than k neighbours
+    while len(vectors) < 2*k:
+        vectors.extend([0.0, 0.0])
+    if none:
+        return np.zeros((2,2))
+
+    return np.array(vectors)
+
+
 def push_from_border(agent, margin=50, force=9.0):
     dx = 0.0
     dy = 0.0
@@ -79,20 +96,19 @@ def mlp_back(x, h, o, target, w1, b1, w2, b2, lr):
     return w1,b1,w2,b2
 
 class Agent:
-    def __init__(self, color, kind, W, H):
+    def __init__(self, color, kind, W, H, k=3):
         self.kind = kind
         self.color = color
         self.W = W
         self.H = H
+        self.k = k  # number of neighbours to track
         self.respawn()
 
-        # determine input size
         if kind == "prey":
-            in_size = 4   # dx, dy + neighbour dx, dy
+            in_size = 2 + 2 * k  # dx/dy to predator + dx/dy for each of k neighbours
         else:
-            in_size = 4   # dx, dy + size, speed_factor
+            in_size = 4  # dx, dy + size, speed_factor
 
-        # initialize weights correctly
         self.w1 = np.zeros((in_size, 6))
         self.b1 = np.zeros(6)
         self.w2 = np.zeros((6, 2))
@@ -100,6 +116,8 @@ class Agent:
         self.lr = 0.02
         self.score = 0
         self.explore = 1.0
+
+        self.x, self.y = 0, 0
 
 
     def respawn(self):
@@ -231,12 +249,14 @@ while running:
 
             # get prey within sight radius
             visible_prey = [f for f in prey if math.hypot(f.x - p.x, f.y - p.y) <= PRED_SIGHT_RADIUS]
-
-            visible_prey = [f for f in prey if math.hypot(f.x - p.x, f.y - p.y) <= PRED_SIGHT_RADIUS]
             if visible_prey:
                 nearest = min(visible_prey, key=lambda f: (f.x - p.x)**2 + (f.y - p.y)**2)
                 tpos = (nearest.x, nearest.y)
-                inp, h, out = p.forward_and_move(tpos)
+                # inside prey loop
+                neigh_vecs = neighbour_vectors(p, prey, p.k, none = True)
+                print(visible_prey)
+                inp, h, out = p.forward_and_move((visible_prey[0].x, visible_prey[0].x), neigh_vecs)
+
 
                 d = math.hypot(p.x - nearest.x, p.y - nearest.y)
                 eaten = d < p.size + 5
@@ -263,7 +283,9 @@ while running:
                 # encourage predator to roam
                                 # before updating position
                 prev_pos = np.array([p.x, p.y])
-                inp, h, out = p.forward_and_move((p.x, p.y))  # current NN output
+                # inside prey loop
+                neigh_vecs = neighbour_vectors(f, prey, f.k)
+                inp, h, out = f.forward_and_move((nearest_pred.x, nearest_pred.y), neigh_vecs)
                 movement = np.array([p.vx, p.vy])              # actual movement including border push
                 targ = normalize(movement) * 0.5               # scale reward for roaming
                 p.learn(inp, h, out, targ)
@@ -282,11 +304,13 @@ while running:
             f.vx += border_push[0]
             f.vy += border_push[1]
 
-
-            nearest_pred = min(pred, key=lambda q:(q.x-f.x)**2+(q.y-f.y)**2)
+            nearest_pred = [p for p in pred if math.hypot(p.x - f.x, p.y - f.y)]
 
             ndx, ndy = neighbour_offset(f, prey)
-            inp, h, out = f.forward_and_move((nearest_pred.x, nearest_pred.y), (ndx, ndy))
+            # inside prey loop
+            neigh_vecs = neighbour_vectors(f, prey, f.k)
+
+            inp, h, out = f.forward_and_move((nearest_pred[0].x, nearest_pred[0].y), neigh_vecs)
 
             dist = math.hypot(f.x - nearest_pred.x, f.y - nearest_pred.y)
             eaten_pred = dist < nearest_pred.size + 5
@@ -320,10 +344,10 @@ while running:
         nearest_pred = min(pred, key=lambda q:(q.x-f.x)**2+(q.y-f.y)**2)
         ndx, ndy = neighbour_offset(f, prey)   # new line
 
-        inp,h,out = f.forward_and_move(
-            (nearest_pred.x, nearest_pred.y),
-            (ndx, ndy)
-        )
+        # inside prey loop
+        neigh_vecs = neighbour_vectors(f, prey, f.k)
+        inp, h, out = f.forward_and_move((nearest_pred.x, nearest_pred.y), neigh_vecs)
+
 
         dist = math.hypot(f.x-nearest_pred.x, f.y-nearest_pred.y)
         eaten_pred = dist < nearest_pred.size + 5
